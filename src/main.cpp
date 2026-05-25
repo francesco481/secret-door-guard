@@ -1,17 +1,4 @@
 /*
- * Smart Lock - AVR-C pentru ATmega2560
- * Versiune finala cu PWM hardware pentru servo
- *
- * MODIFICARE HARDWARE NECESARA:
- *   Servo mutat de pe D10 (PB4) pe D12 (PB6 = OC1B)
- *   Relay ramane pe D11 (PB5) - GPIO pur, neatins de timer
- *
- * Motivatie:
- *   PWM software via ISR pe D10 are race condition intre COMPA/COMPB
- *   si resetul manual TCNT1=0, ceea ce blocheaza pinul in stare nedefinita.
- *   Timer1 FastPWM (mode 14, ICR1=TOP) genereaza semnal 50Hz hardware
- *   pe OC1B (PB6/D12) fara nicio interventie software in bucla principala.
- *
  * Mapare pini fizici ATmega2560:
  *  - Servo       : PB6  (Arduino D12, OC1B) -> PWM hardware Timer1
  *  - Relay/Bec   : PB5  (Arduino D11)       -> GPIO simplu
@@ -31,7 +18,7 @@
  * PWM servo Timer1 FastPWM mode 14:
  *   TOP = ICR1 = 40000 (prescaler 8, 16MHz -> 0.5us/tick -> 20ms perioada)
  *   OCR1B = 2000 -> 1ms  impuls -> 0   grade
- *   OCR1B = 5000 -> 2.5ms impuls -> 185 grade
+ *   OCR1B = 5000 -> 2.5ms impuls -> 180 grade
  */
 
 #include <avr/io.h>
@@ -55,16 +42,11 @@
 #define LCD_EN    (1 << 2)
 #define LCD_BL    (1 << 3)
 
-/* =========================================================
- * PINI FIZICI
- * ========================================================= */
-/* Servo: D12 = PB6 = OC1B. PWM hardware Timer1 FastPWM mode 14. */
 #define SERVO_DDR   DDRB
 #define SERVO_PORT  PORTB
 #define SERVO_BIT   PB6
 
-/* Relay/Bec: D11 = PB5. GPIO pur.
- * COM1A=00 in TCCR1A => OC1A (PB5) neatins de Timer1. */
+/* Relay COM1A=00 in TCCR1A => OC1A (PB5) neatins de Timer1. */
 #define RELAY_DDR   DDRB
 #define RELAY_PORT  PORTB
 #define RELAY_BIT   PB5
@@ -82,16 +64,10 @@
 #define KP_PORT   PORTC
 #define KP_PINR   PINC
 
-/* =========================================================
- * VARIABILE GLOBALE
- * ========================================================= */
 static char    input_pin[5]  = "";
 static char    master_pin[5] = "";
 static uint8_t mod_schimbare = 0;
 
-/* =========================================================
- * UART
- * ========================================================= */
 static void uart_init(void)
 {
     UBRR0H = (uint8_t)(UBRR_VAL >> 8);
@@ -108,9 +84,7 @@ static void uart_putc(char c)
 
 static void uart_puts(const char *s) { while (*s) uart_putc(*s++); }
 
-/* =========================================================
- * TWI (I2C) hardware
- * ========================================================= */
+// I2C hardware
 #define TWI_FREQ  100000UL
 #define TWBR_VAL  ((F_CPU_HZ / TWI_FREQ - 16) / 2)
 
@@ -148,9 +122,7 @@ static void twi_send_byte(uint8_t addr, uint8_t data)
     twi_stop();
 }
 
-/* =========================================================
- * LCD via PCF8574 (I2C, 4-bit)
- * ========================================================= */
+/* LCD via PCF8574 (I2C, 4-bit) */
 static void lcd_pulse_en(uint8_t data)
 {
     twi_send_byte(LCD_ADDR, data | LCD_EN);
@@ -200,40 +172,15 @@ static void lcd_set_cursor(uint8_t col, uint8_t row)
 static void lcd_print(const char *s) { while (*s) lcd_data((uint8_t)*s++); }
 static void lcd_print_char(char c)   { lcd_data((uint8_t)c); }
 
-/* =========================================================
- * SERVO - PWM hardware pe PB6 (D12, OC1B) via Timer1
- *
- * Timer1 FastPWM mode 14 (WGM13:10 = 1110):
- *   TOP = ICR1 = 40000
- *   Prescaler 8 -> tick = 0.5us -> perioada = 40000 * 0.5us = 20ms (50Hz)
- *
- * COM1B = 10 (non-inverting):
- *   OC1B (PB6) = HIGH la BOTTOM, LOW la OCR1B match
- *   => impuls pozitiv cu latimea OCR1B * 0.5us
- *
- * COM1A = 00:
- *   OC1A (PB5) ignorat de timer -> relay pe PB5 functioneaza ca GPIO pur
- *
- * Conversie unghi -> OCR1B:
- *   0   grade -> OCR1B = 2000 (1000us = 1ms)
- *   185 grade -> OCR1B = 5000 (2500us = 2.5ms)
- *   Formula: OCR1B = 2000 + angle * 3000 / 185
- *
- * Nu sunt necesare ISR-uri - semnalul PWM e generat 100% hardware.
- * ========================================================= */
 static void servo_init(void)
 {
-    // 1. Setăm pinul ca ieșire și ÎN ACELAȘI TIMP îl forțăm în LOW
-    // pentru a evita semnale parazite până pornește PWM-ul
     SERVO_PORT &= ~(1 << SERVO_BIT);
     SERVO_DDR  |= (1 << SERVO_BIT);
 
     TCCR1A = (1 << COM1B1) | (1 << WGM11);
     TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS11);
 
-    ICR1  = 40000;   // 20ms perioadă
-    
-    // IMPORTANTE: Această valoare trebuie să fie fix 1000 pentru 0 grade
+    ICR1  = 40000;
     OCR1B = 1000;    
 }
 
@@ -241,36 +188,22 @@ static void servo_write(uint16_t angle)
 {
     if (angle > 180) angle = 180;
 
-    // Formula precisă pentru intervalul 1000-5000
-    // (5000 - 1000) / 180 = 4000 / 180
     uint32_t ocr = 1000UL + ((uint32_t)angle * 4000UL) / 180UL;
     
     OCR1B = (uint16_t)ocr;
 }
 
-/* =========================================================
- * RELAY
- * ========================================================= */
+/* RELAY  */
 static void relay_init(void)
 {
     RELAY_DDR  |=  (1 << RELAY_BIT);
-    RELAY_PORT |=  (1 << RELAY_BIT);   /* HIGH = bec stins initial */
+    RELAY_PORT |=  (1 << RELAY_BIT);
 }
 
-static void relay_on(void)  { RELAY_PORT &= ~(1 << RELAY_BIT); }   /* LOW  = aprins */
-static void relay_off(void) { RELAY_PORT |=  (1 << RELAY_BIT); }   /* HIGH = stins  */
+static void relay_on(void)  { RELAY_PORT &= ~(1 << RELAY_BIT); }
+static void relay_off(void) { RELAY_PORT |=  (1 << RELAY_BIT); }
 
-/* =========================================================
- * HC-SR04 - masurare cu Timer3 hardware
- *
- * Timer3: prescaler 8 -> 0.5us/tick, independent de Timer1.
- * Pornit la inceputul masurarii, oprit la sfarsit.
- *
- * Formula: distanta [cm] = ticks * 17 / 2000
- *   (echivalent: ticks * 0.5us * 0.034cm/us / 2)
- *
- * Timeout: 60000 ticks = 30ms (identic cu pulseIn(..., 30000) Arduino)
- * ========================================================= */
+/* HC-SR04  */
 static void ultrasonic_init(void)
 {
     TRIG_DDR  |=  (1 << TRIG_BIT);
@@ -280,23 +213,19 @@ static void ultrasonic_init(void)
 
 static uint16_t citeste_distanta(void)
 {
-    /* Timer3: Normal mode, prescaler 8 -> 0.5us/tick */
     TCCR3A = 0x00;
     TCCR3B = (1 << CS31);
     TCNT3  = 0;
 
-    /* Trigger 10us */
     TRIG_PORT |=  (1 << TRIG_BIT);
     _delay_us(10);
     TRIG_PORT &= ~(1 << TRIG_BIT);
 
-    /* Asteapta flanc RISING pe Echo */
     uint32_t to = 480000UL;
     while (!(ECHO_PINR & (1 << ECHO_BIT))) {
         if (!--to) { TCCR3B = 0x00; return 999; }
     }
 
-    /* Masoara durata pulsului Echo */
     TCNT3 = 0;
     while (ECHO_PINR & (1 << ECHO_BIT)) {
         if (TCNT3 > 60000U) { TCCR3B = 0x00; return 999; }
@@ -308,12 +237,7 @@ static uint16_t citeste_distanta(void)
     return (uint16_t)((uint32_t)ticks * 17UL / 2000UL);
 }
 
-/* =========================================================
- * KEYPAD 4x4
- *
- * ROWS: biti 7..4 pe PORTC (D30..D33) -> iesiri
- * COLS: biti 3..0 pe PORTC (D34..D37) -> intrari cu pull-up
- * ========================================================= */
+/* KEYPAD 4x4 */
 static const char key_map[4][4] = {
     {'1','2','3','A'},
     {'4','5','6','B'},
@@ -360,9 +284,7 @@ static char keypad_wait_for_key(void)
     return k;
 }
 
-/* =========================================================
- * EEPROM
- * ========================================================= */
+/* EEPROM */
 static void salveaza_pin(const char *pin)
 {
     for (uint8_t i = 0; i < 4; i++)
@@ -379,13 +301,12 @@ static void citeste_pin(void)
     master_pin[4] = '\0';
 }
 
-/* =========================================================
- * TIMER0 -> millis()
- * Prescaler 64 -> ~1.024ms/OVF (identic cu Arduino)
- * ========================================================= */
+/* TIMER0 -> millis() */
 static volatile uint32_t t0_ms = 0;
 
-ISR(TIMER0_OVF_vect) { t0_ms++; }
+ISR(TIMER0_OVF_vect) { 
+    t0_ms++; 
+}
 
 static void timer0_init(void)
 {
@@ -396,7 +317,11 @@ static void timer0_init(void)
 
 static uint32_t millis(void)
 {
-    uint32_t m; cli(); m = t0_ms; sei(); return m;
+    uint32_t m; 
+    cli();
+    m = t0_ms; 
+    sei(); 
+    return m;
 }
 
 static void delay_ms(uint32_t ms)
@@ -405,9 +330,6 @@ static void delay_ms(uint32_t ms)
     while ((millis() - t) < ms);
 }
 
-/* =========================================================
- * LOGICA APLICATIE
- * ========================================================= */
 static void reset_interfata(void)
 {
     lcd_clear();
@@ -423,7 +345,7 @@ static void gestioneaza_acces(void)
     char buf[32];
 
     relay_on();        
-    servo_write(180);  // Deschidere completă la 180 grade
+    servo_write(180);
     
     lcd_clear();
     lcd_set_cursor(0, 0);
@@ -513,9 +435,6 @@ static void verifica_cod(void)
     }
 }
 
-/* =========================================================
- * MAIN
- * ========================================================= */
 int main(void)
 {
     uart_init();
@@ -525,8 +444,8 @@ int main(void)
     ultrasonic_init();
     keypad_init();
     timer0_init();
-    servo_init();   /* Timer1 FastPWM hardware, nu necesita sei() pentru PWM */
-    sei();          /* activare ISR Timer0 pentru millis() */
+    servo_init();
+    sei();
 
     citeste_pin();
     reset_interfata();
